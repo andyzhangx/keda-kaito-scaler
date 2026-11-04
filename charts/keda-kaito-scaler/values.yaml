@@ -29,4 +29,10 @@ resources:
 # expected to pass any required tolerations (e.g. a CriticalAddonsOnly
 # toleration for nodes reserved for critical add-ons).
 tolerations: []
-  
+
+# Disposable MRI P/D lab only. NOT a supported public MRI policy API.
+# Enabling installs extra read permissions and tightly named HPA behavior updates.
+# config is KAITO_MRI_POC JSON (see docs/mri-pd-autoscaling-poc.md).
+mriPoc:
+  enabled: false
+  config: ""

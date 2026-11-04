@@ -792,3 +792,10 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENS
 - [Kaito](https://github.com/kaito-project/kaito) - Kubernetes AI Toolchain Operator
 - [KEDA](https://github.com/kedacore/keda) - Kubernetes Event-driven Autoscaling
 - [vLLM](https://github.com/vllm-project/vllm) - Fast and easy-to-use library for LLM inference
+
+## Experimental MRI role-scaling lab
+
+For the disabled-by-default, disposable-cluster-only prefill/decode proof of
+concept, see [MRI P/D autoscaling POC](docs/mri-pd-autoscaling-poc.md). This is not
+production MRI autoscaling support; activation requires the documented KAITO,
+GPU/proxy-metric and exclusive-writer acceptance gates.

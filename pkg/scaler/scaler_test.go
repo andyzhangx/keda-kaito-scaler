@@ -16,6 +16,10 @@ package scaler
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,9 +35,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/kaito-project/keda-kaito-scaler/internal/mritest"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 )
 
 // stubSource is a test double for metricsource.MetricSource.
@@ -779,6 +786,112 @@ func TestReadinessGateValue(t *testing.T) {
 			is.Spec.Replicas = tt.replicas
 			is.Status.ReadyReplicas = tt.ready
 			assert.Equal(t, tt.want, readinessGateValue(is))
+		})
+	}
+}
+
+// The explicit MRI boundary precedes gate/replica special cases and every cache
+// path, even with a healthy snapshot. Neither GetMetrics nor IsActive can bypass it.
+func TestMRIDisabledCannotServeLegacyPaths(t *testing.T) {
+	for _, aggregation := range []string{constants.AggregationGate, constants.AggregationReplicas, "service-avg", constants.AggregationWindowedAvg} {
+		t.Run(aggregation, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
+			is := newReadyInferenceSet("is1", "ns1", true)
+			is.OwnerReferences = []metav1.OwnerReference{{APIVersion: "kaito.sh/v1alpha1", Kind: "MultiRoleInference", Name: "demo", UID: "mri", Controller: ptr.To(true)}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(is).Build()
+			s := newTestScaler(c, &stubSource{}, &stubAggregator{value: 100})
+			meta := newValidScalerMetadata()
+			meta[constants.AggregationInMetadata] = aggregation
+			if aggregation == constants.AggregationGate {
+				meta[constants.MetricNameInMetadata] = "readiness_gate"
+			}
+			if aggregation == constants.AggregationReplicas {
+				meta[constants.MetricNameInMetadata] = "replica_count"
+			}
+			ref := &externalscaler.ScaledObjectRef{Name: is.Name, Namespace: is.Namespace, ScalerMetadata: meta}
+			value, err := s.GetMetrics(context.Background(), &externalscaler.GetMetricsRequest{ScaledObjectRef: ref, MetricName: meta[constants.MetricNameInMetadata]})
+			assert.Error(t, err)
+			assert.Nil(t, value)
+			active, err := s.IsActive(context.Background(), ref)
+			assert.Error(t, err)
+			assert.Nil(t, active)
+		})
+	}
+}
+
+type mriRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f mriRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMRIMetricsEndToEndWithFakeAPIAndHTTP(t *testing.T) {
+	// Intentionally serial: intercept HTTP only for these fake service hostnames.
+	original := http.DefaultTransport
+	defer func() { http.DefaultTransport = original }()
+	for _, role := range []string{"prefill", "decode"} {
+		t.Run(role, func(t *testing.T) {
+			ctx := context.Background()
+			g, is, cl := mritest.Fixture(t)
+			assert.NoError(t, cl.Get(ctx, types.NamespacedName{Namespace: "lab", Name: "demo-" + role}, is))
+			is.Annotations = map[string]string{constants.AnnotationKeyAutoProvision: "true", constants.AnnotationKeyMinReplicas: "1", constants.AnnotationKeyMaxReplicas: "4", constants.AnnotationKeyMetrics: "- name: " + mripoc.ExpectedMetric(role) + "\n  type: gauge\n  source: modelpod\n  aggregation: service-avg\n  upthreshold: 10\n  downthreshold: 2\n"}
+			mritest.AddMember(t, g, is, cl, "ws-"+role)
+			b := scaledobject.Builder{ScalerNamespace: "lab", ScalerServiceName: "scaler", ScalerGRPCPort: 6000}
+			so, err := b.BuildMRI(is, 1, 4, role)
+			if !assert.NoError(t, err) {
+				return
+			}
+			so.UID = "owned-so"
+			assert.NoError(t, cl.Create(ctx, so))
+			hp := mritest.HPA(so)
+			assert.NoError(t, cl.Create(ctx, hp))
+			s := WithMRIPOC(newTestScaler(cl, &stubSource{}, &stubAggregator{value: 999}), g, b)
+			payload := fmt.Sprintf("# TYPE %s gauge\n%s 3\n", mripoc.ExpectedMetric(role), mripoc.ExpectedMetric(role))
+			calls := 0
+			http.DefaultTransport = mriRoundTripper(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.Host != "ws-"+role+".lab.svc.cluster.local:80" || req.URL.Path != "/metrics" {
+					return nil, fmt.Errorf("wrong endpoint: %s", req.URL)
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(payload)), Header: http.Header{"Content-Type": []string{"text/plain; version=0.0.4"}}}, nil
+			})
+			for _, trigger := range so.Spec.Triggers {
+				ref := &externalscaler.ScaledObjectRef{Name: so.Name, Namespace: so.Namespace, ScalerMetadata: trigger.Metadata}
+				spec, err := s.GetMetricSpec(ctx, ref)
+				if !assert.NoError(t, err) {
+					continue
+				}
+				req := &externalscaler.GetMetricsRequest{ScaledObjectRef: ref, MetricName: spec.MetricSpecs[0].MetricName}
+				resp, err := s.GetMetrics(ctx, req)
+				if !assert.NoError(t, err) {
+					continue
+				}
+				want := 3.0
+				if trigger.Metadata[constants.AggregationInMetadata] == constants.AggregationGate {
+					want = 1
+				}
+				assert.Equal(t, want, resp.MetricValues[0].MetricValueFloat)
+				active, err := s.IsActive(ctx, ref)
+				assert.NoError(t, err)
+				if active != nil {
+					assert.True(t, active.Result)
+				}
+			}
+			assert.Greater(t, calls, 0)
+			metric := so.Spec.Triggers[0]
+			for _, trigger := range so.Spec.Triggers {
+				if trigger.Metadata[constants.AggregationInMetadata] != constants.AggregationGate {
+					metric = trigger
+				}
+			}
+			req := &externalscaler.GetMetricsRequest{ScaledObjectRef: &externalscaler.ScaledObjectRef{Name: so.Name, Namespace: so.Namespace, ScalerMetadata: metric.Metadata}, MetricName: metric.Metadata[constants.MetricNameInMetadata]}
+			payload = ""
+			resp, err := s.GetMetrics(ctx, req)
+			assert.Error(t, err)
+			assert.Nil(t, resp)
+			g.Config.Activate = false
+			resp, err = s.GetMetrics(ctx, req)
+			assert.Error(t, err)
+			assert.Nil(t, resp)
 		})
 	}
 }

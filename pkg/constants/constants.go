@@ -16,6 +16,7 @@
 package constants
 
 const (
+	ScalerName = "keda-kaito-scaler"
 	// AnnotationKeyManagedBy marks a ScaledObject as managed by keda-kaito-scaler.
 	AnnotationKeyManagedBy = "scaledobject.kaito.sh/managed-by"
 	// AnnotationKeyAutoProvision enables auto-provisioning when set to "true".

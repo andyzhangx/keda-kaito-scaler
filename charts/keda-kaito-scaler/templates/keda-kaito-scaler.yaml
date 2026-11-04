@@ -89,6 +89,11 @@ spec:
           command:
             - /keda-kaito-scaler
           image: {{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+          {{- if .Values.mriPoc.enabled }}
+          env:
+            - name: KAITO_MRI_POC
+              value: {{ required "mriPoc.config JSON is required" .Values.mriPoc.config | quote }}
+          {{- end }}
           imagePullPolicy: IfNotPresent
           name: keda-kaito-scaler
           ports:

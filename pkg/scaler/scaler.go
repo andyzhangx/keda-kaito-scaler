@@ -16,6 +16,7 @@ package scaler
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,11 +36,13 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	inferencesetutil "github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
 
 const (
-	ScalerName = "keda-kaito-scaler"
+	ScalerName = constants.ScalerName
 
 	reasonMetricsUnavailable      = "MetricsUnavailable"
 	reasonMetricAggregationFailed = "MetricAggregationFailed"
@@ -104,6 +108,8 @@ func (c *Config) scrapeConfig() metricsource.ScrapeConfig {
 // selects its aggregator via the aggregation metadata key; the readiness gate is
 // the only aggregation handled without an aggregators-map entry.
 type KaitoScaler struct {
+	MRIPOCBuilder scaledobject.Builder
+	MRIPOC        *mripoc.Guard
 	kubeClient    client.Client
 	serviceReader client.Reader
 	aggregators   map[string]aggregator.Aggregator
@@ -154,6 +160,14 @@ func (e *KaitoScaler) IsActive(ctx context.Context, sor *externalscaler.ScaledOb
 		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get InferenceSet(%s) in Namespace(%s): %v", scalerConfig.InferenceSetName, scalerConfig.InferenceSetNamespace, err))
 	}
 
+	if e.MRIPOC.Handles(inferenceSet) {
+		_, err := e.mriMetrics(ctx, &externalscaler.GetMetricsRequest{ScaledObjectRef: sor, MetricName: scalerConfig.MetricName}, scalerConfig, inferenceSet)
+		if err != nil {
+			return nil, err
+		}
+		return &externalscaler.IsActiveResponse{Result: true}, nil
+	}
+
 	condition := metav1.Condition{}
 	for i := range inferenceSet.Status.Conditions {
 		if inferenceSet.Status.Conditions[i].Type == string(kaitov1beta1.InferenceSetConditionTypeReady) {
@@ -197,6 +211,15 @@ func (e *KaitoScaler) GetMetrics(ctx context.Context, gmr *externalscaler.GetMet
 	scalerConfig, err := parseScalerMetadata(gmr.ScaledObjectRef, gmr.MetricName)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check MRI before every legacy special case, zero fallback or cache lookup.
+	live, err := e.getInferenceSet(ctx, scalerConfig)
+	if err != nil {
+		return nil, err
+	}
+	if e.MRIPOC.Handles(live) {
+		return e.mriMetrics(ctx, gmr, scalerConfig, live)
 	}
 
 	// The readiness gate and replica count need no scrape; both derive their
@@ -524,4 +547,85 @@ func newMetricValueResponse(name string, value float64) *externalscaler.GetMetri
 			{MetricName: name, MetricValueFloat: value},
 		},
 	}
+}
+
+func (s *KaitoScaler) mriMetrics(ctx context.Context, req *externalscaler.GetMetricsRequest, cfg *Config, is *kaitov1beta1.InferenceSet) (*externalscaler.GetMetricsResponse, error) {
+	fail := func(err error) (*externalscaler.GetMetricsResponse, error) {
+		return nil, status.Errorf(codes.Unavailable, "MRI POC hold: %v", err)
+	}
+	if s.MRIPOC == nil {
+		return fail(fmt.Errorf("disabled"))
+	}
+	live := new(kaitov1beta1.InferenceSet)
+	if err := s.MRIPOC.Reader.Get(ctx, client.ObjectKeyFromObject(is), live); err != nil {
+		return fail(err)
+	}
+	is = live
+	role, err := s.MRIPOC.Authorize(ctx, is, true)
+	if err != nil {
+		return fail(err)
+	}
+	if is.Annotations[constants.AnnotationKeyAutoProvision] != "true" {
+		return fail(fmt.Errorf("child activation disabled"))
+	}
+	own, err := s.MRIPOC.CheckTargeters(ctx, is)
+	if err != nil {
+		return fail(err)
+	}
+	if own == nil || req.ScaledObjectRef.Name != own.Name || req.ScaledObjectRef.Namespace != own.Namespace {
+		return fail(fmt.Errorf("requires the authorized owned ScaledObject"))
+	}
+	if cfg.ZeroReplicaFallback || cfg.MetricProtocol != "http" || cfg.MetricPort != "80" || cfg.MetricPath != "/metrics" || (cfg.Aggregation != constants.AggregationGate && (cfg.Aggregation != "service-avg" || cfg.MetricSource != "modelpod" || cfg.MetricName != mripoc.ExpectedMetric(role))) || (cfg.Aggregation == constants.AggregationGate && cfg.MetricName != "readiness_gate") {
+		return fail(fmt.Errorf("unsupported MRI trigger"))
+	}
+	// Incoming metadata must match a trigger on the live owned object; old trigger
+	// requests cannot route a replaced or edited role through a legacy source.
+	matched := false
+	for _, t := range own.Spec.Triggers {
+		if reflect.DeepEqual(t.Metadata, req.ScaledObjectRef.ScalerMetadata) {
+			matched = true
+		}
+	}
+	if !matched {
+		return fail(fmt.Errorf("trigger metadata changed"))
+	}
+	min, err := strconv.Atoi(is.Annotations[constants.AnnotationKeyMinReplicas])
+	if err != nil {
+		return fail(err)
+	}
+	max, err := strconv.Atoi(is.Annotations[constants.AnnotationKeyMaxReplicas])
+	if err != nil {
+		return fail(err)
+	}
+	desired, err := s.MRIPOCBuilder.BuildMRI(is, min, max, role)
+	if err != nil {
+		return fail(err)
+	}
+	if !apiequality.Semantic.DeepEqual(own.Spec, desired.Spec) {
+		return fail(fmt.Errorf("live ScaledObject differs from authorized child policy"))
+	}
+	if err := s.MRIPOC.CheckServing(ctx, is, own, role); err != nil {
+		return fail(err)
+	}
+	v, err := s.MRIPOC.Collect(ctx, is, role, cfg.MetricName)
+	if err != nil {
+		return fail(err)
+	}
+	ownAfter, err := s.MRIPOC.CheckTargeters(ctx, is)
+	if err != nil {
+		return fail(err)
+	}
+	if ownAfter == nil || ownAfter.ResourceVersion != own.ResourceVersion {
+		return fail(fmt.Errorf("SO changed during scrape"))
+	}
+	if err := s.MRIPOC.CheckServing(ctx, is, ownAfter, role); err != nil {
+		return fail(err)
+	}
+	return &externalscaler.GetMetricsResponse{MetricValues: []*externalscaler.MetricValue{{MetricName: req.MetricName, MetricValueFloat: v}}}, nil
+}
+
+func WithMRIPOC(s *KaitoScaler, g *mripoc.Guard, b scaledobject.Builder) *KaitoScaler {
+	s.MRIPOCBuilder = b
+	s.MRIPOC = g
+	return s
 }

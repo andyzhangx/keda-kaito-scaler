@@ -37,7 +37,7 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/aggregator"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
-	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
 )
 
 const (
@@ -890,7 +890,7 @@ func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, m
 			Name:      is.Name,
 			Namespace: is.Namespace,
 			Annotations: map[string]string{
-				constants.AnnotationKeyManagedBy: scaler.ScalerName,
+				constants.AnnotationKeyManagedBy: constants.ScalerName,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -924,4 +924,34 @@ func (b Builder) buildScaledObject(is *kaitov1beta1.InferenceSet, minReplicas, m
 		so.Spec.InitialCooldownPeriod = cfg.initialCooldownPeriod
 	}
 	return so
+}
+
+// BuildMRI uses the existing child annotation parser, then narrows it to the lab
+// contract. No parent policy or public schema is introduced.
+func (b Builder) BuildMRI(is *kaitov1beta1.InferenceSet, minReplicas, maxReplicas int, role string) (*v1alpha1.ScaledObject, error) {
+	if minReplicas < 1 || maxReplicas > math.MaxInt32 || maxReplicas < minReplicas || is.Spec.NodeCountLimit != 0 || is.Spec.Replicas == nil || minReplicas > int(*is.Spec.Replicas) || maxReplicas < int(*is.Spec.Replicas) {
+		return nil, fmt.Errorf("MRI requires positive bounds and max >= live count")
+	}
+	cfg, err := parseMetricsConfig(is.Annotations, minReplicas)
+	if err != nil {
+		return nil, err
+	}
+	var specs []metricSpec
+	if err := yaml.UnmarshalStrict([]byte(is.Annotations[constants.AnnotationKeyMetrics]), &specs); err != nil {
+		return nil, err
+	}
+	if len(specs) != 1 {
+		return nil, fmt.Errorf("MRI requires exactly one role-local gauge")
+	}
+	m := specs[0]
+	if m.Name != mripoc.ExpectedMetric(role) || m.Type != "gauge" || m.Source != "modelpod" || m.Aggregation != "service-avg" || m.UpThreshold == nil || m.DownThreshold == nil || *m.DownThreshold < 0 || *m.DownThreshold >= *m.UpThreshold || m.ActivationThreshold != nil || m.DeactivationThreshold != nil || m.MetricCacheWindow != nil {
+		return nil, fmt.Errorf("MRI requires role-local modelpod/service-avg gauge and 0 <= down < up")
+	}
+	so := b.buildScaledObject(is, minReplicas, maxReplicas, cfg)
+	// Do not even emit a downscale recommendation. HPA Disabled is independently
+	// enforced because max clamping and other writers can bypass formula intent.
+	so.Spec.Advanced.ScalingModifiers.Formula = fmt.Sprintf("(%s == 1 && %s > %s) ? 2.0 : 1.0", gateTriggerName, formulaVarName(cfg.metrics[0].key), cfg.metrics[0].upThreshold)
+	so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleDown.SelectPolicy = ptr.To(autoscalingv2.DisabledPolicySelect)
+	so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleUp.Policies = []autoscalingv2.HPAScalingPolicy{{Type: autoscalingv2.PodsScalingPolicy, Value: 1, PeriodSeconds: 60}}
+	return so, nil
 }

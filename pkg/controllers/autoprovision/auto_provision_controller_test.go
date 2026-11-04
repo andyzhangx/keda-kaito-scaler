@@ -24,6 +24,7 @@ import (
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
+	"github.com/kaito-project/keda-kaito-scaler/internal/mritest"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
 )
 
 func TestResolveMinReplicas(t *testing.T) {
@@ -653,7 +656,7 @@ func TestReconcile_EqualPositiveReplicaBounds(t *testing.T) {
 	}
 }
 
-func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) {
+func TestInferenceSetPredicate_RoutesMRIToAuthorization(t *testing.T) {
 	is := scaleToZeroIS("test-is", "default")
 	is.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "kaito.sh/v1beta1",
@@ -664,7 +667,7 @@ func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) 
 	}}
 
 	pred := generateInferenceSetPredicateFunc()
-	assert.False(t, pred.Create(event.CreateEvent{Object: is}))
+	assert.True(t, pred.Create(event.CreateEvent{Object: is}))
 
 	alwaysOn := scaleToZeroIS("test-is-2", "default")
 	alwaysOn.OwnerReferences = is.OwnerReferences
@@ -675,9 +678,78 @@ func TestInferenceSetPredicate_ExcludesMultiRoleInferenceChildren(t *testing.T) 
   upthreshold: 10
   downthreshold: 2
 `
-	assert.False(t, pred.Create(event.CreateEvent{Object: alwaysOn}))
+	assert.True(t, pred.Create(event.CreateEvent{Object: alwaysOn}))
 
 	old := alwaysOn.DeepCopy()
 	alwaysOn.Annotations[constants.AnnotationKeyMaxReplicas] = "10"
-	assert.False(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: alwaysOn}))
+	assert.True(t, pred.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: alwaysOn}))
+}
+
+func TestScaleDownSelectPolicyDrift(t *testing.T) {
+	desired := &autoscalingv2.HPAScalingRules{SelectPolicy: ptr.To(autoscalingv2.DisabledPolicySelect)}
+	old := desired.DeepCopy()
+	old.SelectPolicy = ptr.To(autoscalingv2.MaxChangePolicySelect)
+	assert.True(t, scalingRulesChanged(old, desired))
+	assert.False(t, scalingRulesChanged(desired.DeepCopy(), desired))
+}
+
+func TestReconcileMRIDisabledNeverCleansUpOwnedSO(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, kaitov1beta1.AddToScheme(scheme))
+	assert.NoError(t, v1alpha1.AddToScheme(scheme))
+	for _, enabled := range []string{"false", "true"} {
+		t.Run(enabled, func(t *testing.T) {
+			is := scaleToZeroIS("is", "lab")
+			is.Annotations[constants.AnnotationKeyAutoProvision] = enabled
+			is.OwnerReferences = []metav1.OwnerReference{{APIVersion: "wrong.group/v1", Kind: "MultiRoleInference", Name: "parent", UID: "parent", Controller: ptr.To(true)}}
+			so := &v1alpha1.ScaledObject{ObjectMeta: metav1.ObjectMeta{Name: is.Name, Namespace: is.Namespace, OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(is, kaitov1beta1.GroupVersion.WithKind("InferenceSet"))}}}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(is, so).Build()
+			c := NewAutoProvisionController(cl, "lab", "scaler", 6000, nil)
+			_, err := c.Reconcile(context.Background(), is)
+			assert.NoError(t, err)
+			after := new(v1alpha1.ScaledObject)
+			assert.NoError(t, cl.Get(context.Background(), client.ObjectKeyFromObject(so), after))
+			assert.Empty(t, after.Spec.Triggers)
+		})
+	}
+}
+
+func TestMRIReconcileCreatesAndRepairsOnlyAuthorizedRole(t *testing.T) {
+	for _, role := range []string{"prefill", "decode"} {
+		t.Run(role, func(t *testing.T) {
+			ctx := context.Background()
+			g, is, cl := mritest.Fixture(t)
+			assert.NoError(t, cl.Get(ctx, types.NamespacedName{Namespace: "lab", Name: "demo-" + role}, is))
+			is.Annotations = map[string]string{constants.AnnotationKeyAutoProvision: "true", constants.AnnotationKeyMinReplicas: "1", constants.AnnotationKeyMaxReplicas: "4", constants.AnnotationKeyMetrics: "- name: " + mripoc.ExpectedMetric(role) + "\n  type: gauge\n  source: modelpod\n  aggregation: service-avg\n  upthreshold: 10\n  downthreshold: 2\n"}
+			mritest.AddMember(t, g, is, cl, "ws-"+role)
+			c := NewAutoProvisionController(cl, "lab", "scaler", 6000, nil)
+			c.MRIPOC = g
+			_, err := c.Reconcile(ctx, is)
+			assert.NoError(t, err)
+			so := new(v1alpha1.ScaledObject)
+			if !assert.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(is), so)) {
+				return
+			}
+			assert.Equal(t, is.Name, so.Spec.ScaleTargetRef.Name)
+			assert.Equal(t, autoscalingv2.DisabledPolicySelect, *so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleDown.SelectPolicy)
+			so.UID = "owned-so"
+			so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleDown.SelectPolicy = ptr.To(autoscalingv2.MaxChangePolicySelect)
+			assert.NoError(t, cl.Update(ctx, so))
+			hp := mritest.HPA(so)
+			assert.NoError(t, cl.Create(ctx, hp))
+			_, err = c.Reconcile(ctx, is)
+			assert.NoError(t, err)
+			assert.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(so), so))
+			assert.Equal(t, autoscalingv2.DisabledPolicySelect, *so.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior.ScaleDown.SelectPolicy)
+			assert.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(hp), hp))
+			assert.Equal(t, autoscalingv2.DisabledPolicySelect, *hp.Spec.Behavior.ScaleDown.SelectPolicy)
+			before := so.DeepCopy()
+			is.Annotations[constants.AnnotationKeyAutoProvision] = "false"
+			assert.NoError(t, cl.Update(ctx, is))
+			_, err = c.Reconcile(ctx, is)
+			assert.NoError(t, err)
+			assert.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(so), so))
+			assert.Equal(t, before.ResourceVersion, so.ResourceVersion)
+		})
+	}
 }

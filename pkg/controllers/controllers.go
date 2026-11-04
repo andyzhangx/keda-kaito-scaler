@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers/autoprovision"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/controller"
 )
 
@@ -25,9 +26,9 @@ import (
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=list;watch;get;update
 // +kubebuilder:rbac:groups="keda.sh",resources=clustertriggerauthentications,verbs=get;create;update;patch
 
-func NewControllers(mgr manager.Manager, scalerNamespace, scalerServiceName string, scalerGRPCPort int) []controller.Controller {
-	return []controller.Controller{
-		autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace, scalerServiceName, scalerGRPCPort, mgr.GetEventRecorderFor("keda-kaito-scaler")),
-		// add controllers here
-	}
+func NewControllers(mgr manager.Manager, scalerNamespace, scalerServiceName string, scalerGRPCPort int, guard *mripoc.Guard) []controller.Controller {
+	c := autoprovision.NewAutoProvisionController(mgr.GetClient(), scalerNamespace, scalerServiceName, scalerGRPCPort, mgr.GetEventRecorderFor("keda-kaito-scaler"))
+	c.MRIPOC = guard
+	return []controller.Controller{c} // add controllers here
+
 }

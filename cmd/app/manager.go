@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
+	mri "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/open-policy-agent/cert-controller/pkg/rotator"
@@ -56,6 +58,8 @@ import (
 	"github.com/kaito-project/keda-kaito-scaler/pkg/controllers"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/injections"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/metricsource"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaler"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/cert"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/profile"
@@ -88,6 +92,7 @@ const (
 
 func init() {
 	// controller-runtime manager use scheme.Scheme by default
+	utilruntime.Must(mri.AddToScheme(scheme.Scheme))
 	utilruntime.Must(kaitov1beta1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(v1alpha1.AddToScheme(scheme.Scheme))
 }
@@ -116,6 +121,10 @@ func NewKedaKaitoScalerCommand() *cobra.Command {
 
 func Run(opts *options.KedaKaitoScalerOptions) error {
 	ctx := ctrl.SetupSignalHandler()
+	pocConfig, err := mripoc.Parse(os.Getenv(mripoc.Env))
+	if err != nil {
+		return fmt.Errorf("MRI POC config: %w", err)
+	}
 
 	// Unify logging: route controller-runtime logs through klog so every
 	// component (manager, runnables, cert rotator) shares the same pipeline.
@@ -194,8 +203,9 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 		return err
 	}
 
+	guard := &mripoc.Guard{Config: pocConfig, Reader: mgr.GetAPIReader()}
 	// initialize controllers
-	controllers := controllers.NewControllers(mgr, opts.WorkingNamespace, opts.ScalerServiceName, opts.GrpcPort)
+	controllers := controllers.NewControllers(mgr, opts.WorkingNamespace, opts.ScalerServiceName, opts.GrpcPort, guard)
 	for _, c := range controllers {
 		lo.Must0(c.Register(ctx, mgr))
 	}
@@ -217,7 +227,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 	// listening, so the manager alone drives the full lifecycle.
 	lo.Must0(mgr.Add(scaler.NewRunnable(scaler.ServerConfig{
 		Port: opts.GrpcPort,
-		Service: scaler.NewKaitoScalerWithAPIReaderAndRecorder(
+		Service: scaler.WithMRIPOC(scaler.NewKaitoScalerWithAPIReaderAndRecorder(
 			mgr.GetClient(),
 			mgr.GetAPIReader(),
 			metricCache,
@@ -229,7 +239,7 @@ func Run(opts *options.KedaKaitoScalerOptions) error {
 				constants.AggregationWindowedAvg: metricCache,
 			},
 			mgr.GetEventRecorderFor(KedaKaitoScaler),
-		),
+		), guard, scaledobject.Builder{ScalerServiceName: opts.ScalerServiceName, ScalerNamespace: opts.WorkingNamespace, ScalerGRPCPort: opts.GrpcPort}),
 		GetServerCertificate: cert.NewServerCertLoader(secretLister, opts.WorkingNamespace, opts.ScalerServerSecretName, ServerCert, ServerKey),
 		LoadRootCAs:          cert.NewRootCAsLoader(secretLister, opts.WorkingNamespace, opts.ScalerClientSecretName, CACert),
 		ServerCertReady:      serverCertReady,

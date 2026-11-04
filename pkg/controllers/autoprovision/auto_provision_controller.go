@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	mri "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"golang.org/x/time/rate"
@@ -46,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/kaito-project/keda-kaito-scaler/pkg/constants"
+	"github.com/kaito-project/keda-kaito-scaler/pkg/mripoc"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/scaledobject"
 	"github.com/kaito-project/keda-kaito-scaler/pkg/util/inferenceset"
 )
@@ -63,6 +65,7 @@ const (
 )
 
 type Controller struct {
+	MRIPOC *mripoc.Guard
 	client.Client
 	ScalerNamespace   string
 	ScalerServiceName string
@@ -82,6 +85,9 @@ func NewAutoProvisionController(c client.Client, scalerNamespace, scalerServiceN
 
 func (c *Controller) Reconcile(ctx context.Context, is *kaitov1beta1.InferenceSet) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithName("auto-provision-controller")
+	if c.MRIPOC.Handles(is) {
+		return c.reconcileMRI(ctx, is)
+	}
 
 	// When auto-provisioning is not requested (annotation missing or set to a
 	// value other than "true"), tear down any ScaledObject we previously
@@ -349,6 +355,9 @@ func scalingRulesChanged(existing, desired *autoscalingv2.HPAScalingRules) bool 
 	if existing == nil || desired == nil {
 		return existing != desired
 	}
+	if !reflect.DeepEqual(existing.SelectPolicy, desired.SelectPolicy) {
+		return true
+	}
 	if !equalInt32Ptr(existing.StabilizationWindowSeconds, desired.StabilizationWindowSeconds) {
 		return true
 	}
@@ -383,7 +392,7 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 				return false
 			}
 			if isMultiRoleInferenceChild(inferenceSet) {
-				return false
+				return true
 			}
 			// Deliberately does not filter on config validity: an invalid config
 			// must still reach Reconcile so it can be reported as an Event.
@@ -399,8 +408,8 @@ func generateInferenceSetPredicateFunc() predicate.Predicate {
 			if !ok {
 				return false
 			}
-			if isMultiRoleInferenceChild(newInferenceSet) {
-				return false
+			if isMultiRoleInferenceChild(newInferenceSet) || isMultiRoleInferenceChild(oldInferenceSet) {
+				return true
 			}
 
 			// Reconcile when any autoscaling annotation changes. Comparing by
@@ -504,12 +513,12 @@ func annotationsWithPrefixChanged(oldAnnotations, newAnnotations map[string]stri
 // +kubebuilder:rbac:groups="kaito.sh",resources=workspaces,verbs=list;watch
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
-	return controllerruntime.NewControllerManagedBy(m).
+	b := controllerruntime.NewControllerManagedBy(m).
 		Named("scaledobject.provision").
 		For(&kaitov1beta1.InferenceSet{}, builder.WithPredicates(generateInferenceSetPredicateFunc())).
 		Watches(&v1alpha1.ScaledObject{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			if scaledObj, ok := obj.(*v1alpha1.ScaledObject); ok {
-				if scaledObj.Spec.ScaleTargetRef.Kind == constants.InferenceSet {
+				if scaledObj.Spec.ScaleTargetRef != nil && scaledObj.Spec.ScaleTargetRef.Kind == constants.InferenceSet {
 					return []reconcile.Request{
 						{
 							NamespacedName: types.NamespacedName{Namespace: scaledObj.Namespace, Name: scaledObj.Spec.ScaleTargetRef.Name},
@@ -525,6 +534,96 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 				&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 			),
 			MaxConcurrentReconciles: 10,
-		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		})
+	if c.MRIPOC != nil && c.MRIPOC.Config.UID != "" {
+		b = b.Watches(&mri.MultiRoleInference{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			if obj.GetNamespace() != c.MRIPOC.Config.Namespace || obj.GetName() != c.MRIPOC.Config.Name {
+				return nil
+			}
+			var out []reconcile.Request
+			for _, child := range c.MRIPOC.Config.Children {
+				out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: child.Name}})
+			}
+			return out
+		}))
+	}
+	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
+}
+
+// Reconcile authorization is mandatory even when invoked by an owned-SO watch.
+// Disabled or broken scope never invokes legacy delete/adopt/update behavior.
+func (c *Controller) reconcileMRI(ctx context.Context, is *kaitov1beta1.InferenceSet) (reconcile.Result, error) {
+	result := reconcile.Result{RequeueAfter: 15 * time.Second}
+	if c.MRIPOC == nil || c.MRIPOC.Config.UID == "" {
+		return reconcile.Result{}, nil
+	}
+	live := new(kaitov1beta1.InferenceSet)
+	if err := c.MRIPOC.Reader.Get(ctx, client.ObjectKeyFromObject(is), live); err != nil {
+		return result, err
+	}
+	is = live
+	role, err := c.MRIPOC.Authorize(ctx, is, true)
+	if err != nil {
+		return result, err
+	}
+	if !autoProvisionRequested(is) {
+		return result, nil
+	} // manual shutdown; no automatic delete
+	own, err := c.MRIPOC.CheckTargeters(ctx, is)
+	if err != nil {
+		return result, err
+	}
+	min, err := strconv.Atoi(is.Annotations[constants.AnnotationKeyMinReplicas])
+	if err != nil {
+		return result, err
+	}
+	max, err := strconv.Atoi(is.Annotations[constants.AnnotationKeyMaxReplicas])
+	if err != nil {
+		return result, err
+	}
+	desired, err := (scaledobject.Builder{ScalerServiceName: c.ScalerServiceName, ScalerNamespace: c.ScalerNamespace, ScalerGRPCPort: c.ScalerGRPCPort}).BuildMRI(is, min, max, role)
+	if err != nil {
+		return result, err
+	}
+	// Re-read just before a write. This cannot replace lab writer exclusion.
+	if _, err := c.MRIPOC.Authorize(ctx, is, true); err != nil {
+		return result, err
+	}
+	if own == nil {
+		if err := c.MRIPOC.Ready(ctx, is, role); err != nil {
+			return result, err
+		}
+		if _, err := c.MRIPOC.Authorize(ctx, is, true); err != nil {
+			return result, err
+		}
+		if _, err := c.MRIPOC.CheckTargeters(ctx, is); err != nil {
+			return result, err
+		}
+		return result, c.Create(ctx, desired)
+	}
+	// Repair live, correctly-owned HPA behavior too, without changing its bounds.
+	hpas := new(autoscalingv2.HorizontalPodAutoscalerList)
+	if err := c.MRIPOC.Reader.List(ctx, hpas, client.InNamespace(is.Namespace)); err != nil {
+		return result, err
+	}
+	for i := range hpas.Items {
+		h := &hpas.Items[i]
+		if !mripoc.Owned(h, "keda.sh", "ScaledObject", own.Name, own.UID) {
+			continue
+		}
+		if h.Name != "keda-hpa-"+own.Name || !h.DeletionTimestamp.IsZero() || h.Spec.ScaleTargetRef.Name != is.Name || h.Spec.ScaleTargetRef.Kind != constants.InferenceSet || h.Spec.ScaleTargetRef.APIVersion != constants.InferenceSetAPIVersion {
+			return result, fmt.Errorf("owned HPA identity changed before repair")
+		}
+		if h.Spec.MinReplicas == nil || *h.Spec.MinReplicas < 1 || *h.Spec.MinReplicas > *is.Spec.Replicas || h.Spec.MaxReplicas < *is.Spec.Replicas {
+			return result, fmt.Errorf("unsafe live HPA bounds; stop writers before recovery")
+		}
+		want := desired.Spec.Advanced.HorizontalPodAutoscalerConfig.Behavior
+		if h.Spec.Behavior == nil || scalingRulesChanged(h.Spec.Behavior.ScaleDown, want.ScaleDown) || scalingRulesChanged(h.Spec.Behavior.ScaleUp, want.ScaleUp) {
+			h.Spec.Behavior = want.DeepCopy()
+			if err := c.Update(ctx, h); err != nil {
+				return result, err
+			}
+		}
+	}
+	return result, c.reconcileTo(ctx, own, desired)
 }

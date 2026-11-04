@@ -1,0 +1,64 @@
+{{- if .Values.mriPoc.enabled }}
+{{- $config := mustFromJson (required "mriPoc.config JSON is required" .Values.mriPoc.config) }}
+# Additional reads only; the scaler never gains InferenceSet/Workspace /scale writes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-mri-poc-read
+rules:
+- apiGroups: ["kaito.sh"]
+  resources: ["multiroleinferences"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-mri-poc-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-mri-poc-read
+subjects:
+- kind: ServiceAccount
+  name: keda-kaito-scaler-sa
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-mri-poc-hpa
+  namespace: {{ required "MRI namespace required" $config.namespace }}
+rules:
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  resourceNames:
+  - {{ printf "keda-hpa-%s" $config.children.prefill.name | quote }}
+  - {{ printf "keda-hpa-%s" $config.children.decode.name | quote }}
+  verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-mri-poc-hpa
+  namespace: {{ $config.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-mri-poc-hpa
+subjects:
+- kind: ServiceAccount
+  name: keda-kaito-scaler-sa
+  namespace: {{ .Release.Namespace }}
+{{- end }}
